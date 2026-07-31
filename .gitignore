@@ -9,3 +9,5 @@ __pycache__/
 token.json
 credentials.json
 .cursor/
+frontend/node_modules/
+frontend/dist/

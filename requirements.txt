@@ -1,3 +1,5 @@
 ollama>=0.6.2
 mcp>=1.0.0
 python-dotenv>=1.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0

@@ -3,9 +3,14 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
-_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_BACKEND_DIR)
 _PROJECT_VENV_PYTHON = os.path.join(_PROJECT_ROOT, ".venv", "bin", "python")
+
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 
 
 # Prefer this project's .venv when required deps are missing (wrong/foreign venv or system Python).
@@ -28,7 +33,7 @@ if not _mcp_available():
     raise SystemExit(
         "Missing dependency 'mcp'. Install project deps with:\n"
         f"  {_PROJECT_VENV_PYTHON} -m pip install -r requirements.txt\n"
-        f"Then run: {_PROJECT_VENV_PYTHON} search_and_summarize.py ..."
+        f"Then run: {_PROJECT_VENV_PYTHON} backend/search_and_summarize.py ..."
     )
 
 import ollama
@@ -36,7 +41,7 @@ from dotenv import load_dotenv
 
 from mcp_clients import send_drive_link_email, upload_summary_to_drive
 
-load_dotenv()
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +155,60 @@ def _gmail_api_disabled_message() -> str:
     )
 
 
+def _display_email_status(raw_email: str | None) -> str:
+    if not raw_email:
+        return "(not available)"
+    if raw_email == "sent":
+        return "Sent"
+    if raw_email.startswith("failed:") or raw_email.startswith("skipped:"):
+        return raw_email
+    # MCP success payloads vary; treat non-failure text as Sent for the API.
+    return "Sent"
+
+
+def _build_result(
+    *,
+    topic: str,
+    summary: str | None,
+    publish: dict | None,
+    processing_time_seconds: float,
+    error: str | None = None,
+) -> dict:
+    publish = publish or {}
+    drive_link = publish.get("drive_link")
+    raw_email = publish.get("email_status")
+
+    if drive_link:
+        upload_status = "Success"
+    elif isinstance(raw_email, str) and raw_email.startswith("skipped: Drive upload failed"):
+        upload_status = "Failed"
+    elif isinstance(raw_email, str) and raw_email.startswith("skipped:"):
+        upload_status = "Skipped"
+    elif error and not summary:
+        upload_status = "Not started"
+    else:
+        upload_status = "Failed"
+
+    email_failed_or_skipped = isinstance(raw_email, str) and (
+        raw_email.startswith("failed:") or raw_email.startswith("skipped:")
+    )
+    success = bool(drive_link) and not email_failed_or_skipped and error is None
+
+    if error is None and email_failed_or_skipped and isinstance(raw_email, str):
+        error = raw_email
+
+    return {
+        "success": success,
+        "topic": topic,
+        "summary": summary,
+        "google_drive_link": drive_link,
+        "upload_status": upload_status,
+        "email_status": _display_email_status(raw_email),
+        "processing_time_seconds": round(processing_time_seconds, 2),
+        "error": error,
+    }
+
+
 async def publish_and_notify(summary: str, topic: str, filename: str) -> dict:
     """Upload via Drive MCP and notify via Email MCP. Returns status dict."""
     google_user = os.getenv("GOOGLE_USER_EMAIL", "").strip()
@@ -181,7 +240,7 @@ async def publish_and_notify(summary: str, topic: str, filename: str) -> dict:
         logger.info("Uploading %s to Google Drive via MCP", filename)
         file_id, link = await upload_summary_to_drive(
             content=summary,
-            file_name=filename,
+            file_name=os.path.basename(filename),
             user_google_email=google_user,
         )
         result["drive_file_id"] = file_id
@@ -246,51 +305,78 @@ async def publish_and_notify(summary: str, topic: str, filename: str) -> dict:
     return result
 
 
+async def run_workflow(topic: str) -> dict:
+    """Run search → summarize → save → Drive upload → email. Returns API-shaped dict."""
+    topic = (topic or "").strip()
+    if not topic:
+        return _build_result(
+            topic="",
+            summary=None,
+            publish=None,
+            processing_time_seconds=0.0,
+            error="A topic is required.",
+        )
+
+    started = time.perf_counter()
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+    filename = os.path.join(_PROJECT_ROOT, "summary.txt")
+
+    try:
+        logger.info("Searching topic: %s", topic)
+        search_results = search_topic(topic)
+
+        logger.info("Summarizing with Ollama model %s", model)
+        summary_response = ollama.chat(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Summarize this in 2 sentences:\n\n{search_results}",
+                }
+            ],
+        )
+        summary = summary_response["message"]["content"]
+
+        save_result = save_to_file(summary, filename)
+        logger.info(save_result)
+
+        publish = await publish_and_notify(summary, topic, filename)
+        elapsed = time.perf_counter() - started
+        return _build_result(
+            topic=topic,
+            summary=summary,
+            publish=publish,
+            processing_time_seconds=elapsed,
+        )
+    except Exception as exc:
+        logger.exception("Workflow failed: %s", exc)
+        elapsed = time.perf_counter() - started
+        return _build_result(
+            topic=topic,
+            summary=None,
+            publish=None,
+            processing_time_seconds=elapsed,
+            error=_exception_root_text(exc)[:800],
+        )
+
+
 def main(argv=None):
     args = parse_args(argv)
     topic = resolve_topic(args)
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-    filename = "summary.txt"
+    result = asyncio.run(run_workflow(topic))
 
-    # Step 1: Search
-    logger.info("Searching topic: %s", topic)
-    search_results = search_topic(topic)
+    if result.get("summary"):
+        print("Summary:", result["summary"])
+        print(f"Saved to {os.path.join(_PROJECT_ROOT, 'summary.txt')}")
 
-    # Step 2: Summarize using Ollama
-    logger.info("Summarizing with Ollama model %s", model)
-    summary_response = ollama.chat(
-        model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Summarize this in 2 sentences:\n\n{search_results}",
-            }
-        ],
-    )
-    summary = summary_response["message"]["content"]
-
-    print("Summary:", summary)
-
-    # Step 3: Save
-    save_result = save_to_file(summary, filename)
-    print(save_result)
-    logger.info(save_result)
-
-    # Step 4–7: Drive MCP upload + shareable link + Email MCP notify
-    publish = asyncio.run(publish_and_notify(summary, topic, filename))
-
-    drive_link = publish.get("drive_link") or "(not available)"
-    email_status = publish.get("email_status") or "(not available)"
+    drive_link = result.get("google_drive_link") or "(not available)"
+    email_status = result.get("email_status") or "(not available)"
     print("Drive link:", drive_link)
     print("Email status:", email_status)
+    if result.get("error"):
+        print("Error:", result["error"])
 
-    if not publish.get("drive_link"):
-        return 1
-    if isinstance(email_status, str) and (
-        email_status.startswith("failed:") or email_status.startswith("skipped:")
-    ):
-        return 1
-    return 0
+    return 0 if result.get("success") else 1
 
 
 if __name__ == "__main__":
