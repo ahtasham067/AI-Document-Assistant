@@ -1,0 +1,3 @@
+Here is a 2-sentence summary:
+
+AI agents are autonomous systems capable of planning and acting on their own without human intervention. They have the ability to make decisions, take actions, and adapt to new situations based on their programming and algorithms.
